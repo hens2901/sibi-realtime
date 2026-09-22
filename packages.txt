@@ -1,4 +1,2 @@
-# System packages (apt) untuk Streamlit Community Cloud.
-# Dibutuhkan agar MediaPipe / OpenCV dapat di-import di Linux headless.
 libgl1
 libglib2.0-0
