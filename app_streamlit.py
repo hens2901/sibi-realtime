@@ -16,8 +16,11 @@ Jalankan:
 from __future__ import annotations
 
 import html
+import os
+import sys
 import threading
 import time
+import traceback
 import warnings
 from pathlib import Path
 
@@ -65,7 +68,35 @@ DEFAULT_MARGIN = 0.20
 DEFAULT_SMOOTHING = rt.SMOOTHING_WINDOW
 DEFAULT_STABLE_FRAMES = rt.STABLE_FRAMES
 
-FRAGMENT_INTERVAL = "0.2s"       # refresh panel UI ~5x/detik (video independen)
+# Auto-refresh panel (A/B): SIBI_UI_REFRESH=off|1.0s|0.5s|0.2s (default 1.0s).
+_ui_refresh = (os.environ.get("SIBI_UI_REFRESH", "1.0s") or "1.0s").strip().lower()
+AUTOREFRESH = _ui_refresh not in ("off", "0", "false", "no", "")
+FRAGMENT_INTERVAL = (_ui_refresh if _ui_refresh not in ("on", "1", "true", "yes")
+                     else "1.0s") if AUTOREFRESH else None
+
+# Logging diagnostik processor: SIBI_PROC_LOG=on -> log siklus + exception penuh.
+PROC_LOG = (os.environ.get("SIBI_PROC_LOG", "off") or "off").strip().lower() \
+    in ("on", "1", "true", "yes")
+
+
+def plog(msg: str) -> None:
+    """Log diagnostik processor (bukan per frame) ke stderr."""
+    if PROC_LOG:
+        print(f"[SIBI-PROC] {msg}", file=sys.stderr, flush=True)
+
+
+# Diagnostik lifecycle (thread-safe).
+_PROC_LOCK = threading.Lock()
+_PROC_CREATED_COUNT = 0
+_FIRST_FRAME_COUNT = 0
+_PROC_CREATED_TS = 0.0
+_FIRST_FRAME_TS = 0.0
+
+# SIBI_ASYNC_PROCESSING=on/off (A/B test async_processing).
+ASYNC_PROCESSING = (os.environ.get("SIBI_ASYNC_PROCESSING", "on") or "on").strip().lower() \
+    not in ("off", "0", "false", "no")
+
+
 RESULT_TTL_S = 1.5            # payload dianggap basi setelah ini (detik)
 MIN_CONFIDENCE, MAX_CONFIDENCE = 0.50, 0.99
 MIN_MARGIN, MAX_MARGIN = 0.00, 0.80
@@ -303,15 +334,33 @@ class SibiVideoProcessor(VideoProcessorBase):
 
     def __init__(self, bundles: dict, settings: RuntimeSettings,
                  shared: LatestResult) -> None:
+        # __init__ HARUS ringan: jangan buat MediaPipe/model di sini, karena
+        # berjalan saat WebRTC establishment dan bisa menghambat media.
+        global _PROC_CREATED_COUNT, _PROC_CREATED_TS
         self.bundles = bundles
         self.settings = settings
         self.shared = shared
-        self.landmarker = rt.build_landmarker(vision.RunningMode.VIDEO)
+        self.landmarker = None
         self.model = self.scaler = self.encoder = None
         self.labels: list[str] = []
         self.smoother = None
         self._engine_key: tuple | None = None
         self._last: "rt.FrameResult | None" = None
+        self._first_frame_logged = False
+        self._detect_logged = False
+        self._init_lock = threading.Lock()
+        self.initialized = False
+        self.landmarker_ready = False
+        self._created_ts = time.perf_counter()
+        self._first_frame_ts = 0.0
+
+        with _PROC_LOCK:
+            _PROC_CREATED_COUNT += 1
+            _PROC_CREATED_TS = self._created_ts
+            created_count = _PROC_CREATED_COUNT
+        snap0 = settings.snapshot()
+        plog(f"PROCESSOR CREATED model_id={snap0.get('model_id')} "
+             f"count={created_count} t={self._created_ts:.3f}")
 
         # metrik
         self._prev_t = time.perf_counter()
@@ -327,13 +376,36 @@ class SibiVideoProcessor(VideoProcessorBase):
         self._infer_count = 0
         self._skipped = 0
 
-        self._sync_engine(settings.snapshot())
+    def _ensure_initialized(self, snap: dict) -> None:
+        """Lazy init (landmarker + engine) di first frame, thread-safe sekali."""
+        if self.initialized:
+            return
+        with self._init_lock:
+            if self.initialized:
+                return
+            plog("LAZY LANDMARKER INIT START")
+            try:
+                self.landmarker = rt.build_landmarker(vision.RunningMode.VIDEO)
+            except Exception:  # noqa: BLE001
+                plog("LAZY LANDMARKER INIT FAILED:\n" + traceback.format_exc())
+                raise
+            self.landmarker_ready = True
+            plog("LAZY LANDMARKER INIT OK")
+            self._sync_engine(snap)
+            self.initialized = True
+            plog("LAZY INIT DONE")
 
     def _sync_engine(self, snap: dict) -> None:
         key = (snap["model_id"], snap["smoothing_window"], snap["stable_frames"])
         if self.smoother is not None and key == self._engine_key:
             return
-        model, scaler, encoder, labels = self.bundles[snap["model_id"]]
+        plog(f"engine sync: model_id={snap['model_id']} (bundles has key: "
+             f"{snap['model_id'] in self.bundles})")
+        try:
+            model, scaler, encoder, labels = self.bundles[snap["model_id"]]
+        except Exception:  # noqa: BLE001
+            plog("engine sync FAILED:\n" + traceback.format_exc())
+            raise
         self.model, self.scaler, self.encoder = model, scaler, encoder
         self.labels = list(labels)
         self.smoother = rt.TemporalSmoother(
@@ -341,7 +413,9 @@ class SibiVideoProcessor(VideoProcessorBase):
             stable_frames=snap["stable_frames"],
         )
         self._engine_key = key
-        self._last = None  # paksa inference ulang setelah ganti engine
+        self._last = None
+        plog(f"ENGINE SYNC OK model_id={snap['model_id']} "
+             f"n_features={getattr(model,'n_features_in_',None)} labels={len(self.labels)}")
 
     def _empty_outcome(self) -> "rt.FrameResult":
         return rt.FrameResult(False, None, 0.0, False, False, None, None)
@@ -354,6 +428,9 @@ class SibiVideoProcessor(VideoProcessorBase):
         mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
         det = self.landmarker.detect_for_video(mp_image, ts_ms)
         mp_ms = (time.perf_counter() - t0) * 1000.0
+        if det.hand_landmarks and not getattr(self, "_detect_logged", False):
+            plog(f"MEDIAPIPE DETECT OK hands={len(det.hand_landmarks)}")
+            self._detect_logged = True
 
         if not det.hand_landmarks:
             self.smoother.update(None)
@@ -363,10 +440,17 @@ class SibiVideoProcessor(VideoProcessorBase):
         t1 = time.perf_counter()
         try:
             feats = rt.normalize_landmarks(hand)
+            plog(f"FEATURES shape={np.shape(feats)}")
             probs = fast_predict_proba(self.model, self.scaler, feats)
+            plog(f"PREDICT OK model_id={self._engine_key[0] if self._engine_key else '?'} "
+                 f"probs_shape={np.shape(probs)} sum={float(np.sum(probs)):.4f} "
+                 f"finite={bool(np.all(np.isfinite(probs)))}")
         except ValueError:
             self.smoother.update(None)
             return self._empty_outcome(), mp_ms, (time.perf_counter() - t1) * 1000.0
+        except Exception:  # noqa: BLE001 - log exception sebenarnya
+            plog("PREDICT FAILED (unexpected):\n" + traceback.format_exc())
+            raise
         pred_ms = (time.perf_counter() - t1) * 1000.0
 
         bbox = rt.compute_bbox(hand, out_w, out_h)
@@ -394,7 +478,8 @@ class SibiVideoProcessor(VideoProcessorBase):
         return outcome, mp_ms, pred_ms
 
     def _payload(self, outcome: "rt.FrameResult", now: float, *,
-                 top5: list | None = None, error: str | None = None) -> dict:
+                 top5: list | None = None, error: str | None = None,
+                 error_detail: str | None = None) -> dict:
         return {
             "t": now,
             "hand_found": bool(outcome.hand_found),
@@ -410,6 +495,7 @@ class SibiVideoProcessor(VideoProcessorBase):
             "margin": float(outcome.margin),
             "top5": top5 or [],
             "error": error,
+            "error_detail": error_detail,
             # metrik performa
             "camera_fps": self._camera_fps,
             "inference_fps": self._inference_fps,
@@ -420,18 +506,37 @@ class SibiVideoProcessor(VideoProcessorBase):
             "draw_ms": self._draw_ms,
             "infer_count": self._infer_count,
             "skipped_frames": self._skipped,
+            # diagnostik lifecycle
+            "model_id": self._engine_key[0] if self._engine_key else None,
+            "initialized": bool(self.initialized),
+            "processor_created_count": _PROC_CREATED_COUNT,
+            "first_frame_count": _FIRST_FRAME_COUNT,
+            "processor_created_ts": _PROC_CREATED_TS,
+            "first_frame_ts": _FIRST_FRAME_TS,
         }
 
     def recv(self, frame: av.VideoFrame) -> av.VideoFrame:
+        global _FIRST_FRAME_COUNT, _FIRST_FRAME_TS
         frame_start = time.perf_counter()
         img = frame.to_ndarray(format="bgr24")
+        # Log RAW frame SEBELUM heavy init, agar bisa membedakan:
+        #   - tidak ada frame WebRTC, atau
+        #   - frame ada tetapi lazy init macet.
+        if not self._first_frame_logged:
+            self._first_frame_logged = True
+            self._first_frame_ts = time.perf_counter()
+            with _PROC_LOCK:
+                _FIRST_FRAME_COUNT += 1
+                _FIRST_FRAME_TS = self._first_frame_ts
+                ff_count = _FIRST_FRAME_COUNT
+            plog(f"FIRST FRAME RAW RECEIVED shape={img.shape} count={ff_count} "
+                 f"t={self._first_frame_ts:.3f}")
         snap = self.settings.snapshot()
         h, w = img.shape[:2]
         try:
+            self._ensure_initialized(snap)
             if snap["mirror"]:
                 img = cv2.flip(img, 1)
-
-            self._sync_engine(snap)
 
             now = time.perf_counter()
             dt = now - self._prev_t
@@ -486,10 +591,12 @@ class SibiVideoProcessor(VideoProcessorBase):
                 self._frame_latency, (time.perf_counter() - frame_start) * 1000.0
             )
         except Exception as exc:  # noqa: BLE001 - jangan crash seluruh app
+            tb = traceback.format_exc()
+            plog("recv EXCEPTION:\n" + tb)
             outcome = self._last or self._empty_outcome()
             self.shared.set(self._payload(
                 outcome, time.perf_counter(),
-                error=f"{type(exc).__name__}: {exc}",
+                error=f"{type(exc).__name__}: {exc}", error_detail=tb,
             ))
             try:
                 draw_frame_overlay(img, outcome, outcome.hand_found)
@@ -707,16 +814,14 @@ def _status_line(state: dict) -> None:
         st.caption(state["hint"])
 
 
-@st.fragment(run_every=FRAGMENT_INTERVAL)
-def prediction_fragment() -> None:
+def _render_prediction_body(reset_when_idle: bool = True) -> None:
     st.subheader("Prediksi")
     payload = st.session_state.shared.get()
     settings = st.session_state.runtime_settings.snapshot()
     state = derive_state(payload, settings)
 
     # Reset prediksi aktif saat kamera mati / data sudah stale.
-    # (Saat tangan hilang, payload terbaru sudah tidak membawa top-1.)
-    if state["kind"] == "idle":
+    if reset_when_idle and state["kind"] == "idle":
         st.session_state.shared.clear()
 
     with st.container(border=True):
@@ -739,6 +844,17 @@ def prediction_fragment() -> None:
 
     if not state["can_add"]:
         st.caption("Tombol aktif saat gesture sudah dikenali dan stabil.")
+
+
+@st.fragment(run_every=FRAGMENT_INTERVAL)
+def prediction_fragment() -> None:
+    """Auto-refresh HANYA dirender saat WebRTC playing (lihat main)."""
+    _render_prediction_body(reset_when_idle=True)
+
+
+def render_prediction_static() -> None:
+    """Panel prediksi tanpa auto-refresh (dipakai saat WebRTC connecting)."""
+    _render_prediction_body(reset_when_idle=False)
 
 
 def render_spelling() -> None:
@@ -821,6 +937,13 @@ def _tech_table(payload: dict, settings: dict, state: dict) -> None:
         ("Ambang keyakinan", f"{settings['threshold']:.2f}"),
         ("Ambang margin", f"{settings['margin']:.2f}"),
         ("Stable frame", f"{settings['stable_frames']}"),
+        ("Error terakhir", payload.get("error") or "-"),
+        ("Processor dibuat (count)", payload.get("processor_created_count")),
+        ("First frame (count)", payload.get("first_frame_count")),
+        ("Initialized", payload.get("initialized")),
+        ("WebRTC playing", st.session_state.get("stream_playing")),
+        ("Processor created t", f"{payload.get('processor_created_ts', 0.0):.3f}"),
+        ("First frame t", f"{payload.get('first_frame_ts', 0.0):.3f}"),
     ]
     st.markdown(
         "| Item | Nilai |\n|:--|:--|\n"
@@ -834,6 +957,13 @@ def render_details() -> None:
     if exp.open:
         payload = st.session_state.shared.get()
         settings = st.session_state.runtime_settings.snapshot()
+
+        # Tampilkan exception sebenarnya (jangan disembunyikan sebagai masalah kamera)
+        if payload and payload.get("error"):
+            st.error(f"Error inference: {payload['error']}", icon=":material/error:")
+            if payload.get("error_detail"):
+                st.code(payload["error_detail"], language="text")
+
         active = active_prediction(payload)
 
         if active is None:
@@ -932,15 +1062,20 @@ def render_camera(bundles: dict, settings: RuntimeSettings,
                 },
                 "audio": False,
             },
-            rtc_configuration={
-                "iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]
-            },
-            # async_processing=True: mode async hanya meneruskan frame TERBARU
-            # ke recv() (frame lama yang menumpuk otomatis di-drop) -> latency
-            # rendah, tidak ada backlog.
-            async_processing=True,
+            rtc_configuration=None,
+            # async_processing: SIBI_ASYNC_PROCESSING=on/off (A/B test).
+            async_processing=ASYNC_PROCESSING,
         )
-        st.session_state.stream_playing = bool(ctx.state.playing)
+        playing = bool(ctx.state.playing)
+        prev = st.session_state.get("_webrtc_playing_prev")
+        if playing and prev is not True:
+            plog(f"WEBRTC PLAYING t={time.perf_counter():.3f} "
+                 f"processor_created={_PROC_CREATED_COUNT}")
+        elif (not playing) and prev is True:
+            plog("WEBRTC STOPPED")
+        st.session_state["_webrtc_playing_prev"] = playing
+        # Catat status saja; JANGAN st.rerun() dari perubahan state kamera.
+        st.session_state.stream_playing = playing
         st.caption(
             "Gunakan tombol **START**/**STOP** pada kamera untuk menyalakan "
             "atau menghentikan, dan **SELECT DEVICE** untuk memilih kamera. "
@@ -991,7 +1126,12 @@ def main() -> None:
     with col_cam:
         render_camera(bundles, settings, shared)
     with col_pred:
-        prediction_fragment()
+        # TEST E: auto-refresh HANYA saat WebRTC benar-benar playing. Saat
+        # connecting, jangan ada rerun berkala (hindari race establishment).
+        if st.session_state.get("stream_playing"):
+            prediction_fragment()
+        else:
+            render_prediction_static()
 
     st.divider()
     render_spelling()
