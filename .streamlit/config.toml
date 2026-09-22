@@ -1,0 +1,10 @@
+# Tema Streamlit untuk aplikasi SIBI Real-Time.
+# Bersih, terang, profesional, dengan aksen biru yang tenang.
+
+[theme]
+base = "light"
+primaryColor = "#2F6FED"
+backgroundColor = "#FFFFFF"
+secondaryBackgroundColor = "#F5F7FA"
+textColor = "#1F2430"
+font = "sans serif"

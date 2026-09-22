@@ -1,0 +1,49 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Notebooks
+.ipynb_checkpoints/
+
+# Secrets / environment
+.env
+.env.*
+*.secret
+.streamlit/secrets.toml
+
+# Datasets (tidak dibutuhkan runtime aplikasi)
+data/raw/
+data/processed/
+data/training/
+data/validation/
+data/*.csv
+
+# Model dinamis J/Z (belum diintegrasikan ke aplikasi Streamlit)
+models/dynamic_jz_*
+models/dynamic_*
+
+# Generated reports & debug (tidak dibutuhkan runtime)
+reports/*
+!reports/STREAMLIT_CLOUD_DEPLOYMENT_CHECKLIST.md
+
+# Debug / temporary
+*.log
+*.tmp
+tmp/
+temp/
+# artefak debug dynamic
+**/realtime_dynamic_debug/
+**/dynamic_previews/
+**/static_reference/
+
+# OS
+.DS_Store
+Thumbs.db

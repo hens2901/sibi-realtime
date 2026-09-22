@@ -1,0 +1,17 @@
+# SIBI Real-Time - DEPLOYMENT runtime requirements (Streamlit Community Cloud)
+# Hanya dependency yang benar-benar di-import oleh app_streamlit.py + realtime.py.
+# TensorFlow/Keras TIDAK diperlukan (GRU J/Z belum diintegrasikan ke aplikasi).
+
+streamlit==1.64.0
+streamlit-webrtc==0.78.1
+av==17.1.0
+mediapipe==1.0.1
+numpy==2.4.6
+pandas==3.0.6
+scikit-learn==1.9.1
+joblib==1.6.0
+
+# OpenCV headless (aplikasi tidak memakai GUI/cv2.imshow).
+# Catatan: mediapipe wajib menarik opencv-contrib-python; keduanya menyediakan
+# paket `cv2`. Aplikasi hanya memakai modul standar sehingga tetap aman.
+opencv-python-headless>=4.8,<6

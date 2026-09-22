@@ -1,0 +1,12 @@
+# SIBI Real-Time - DEVELOPMENT / TRAINING requirements
+# TIDAK dipakai oleh Streamlit Cloud. Untuk eksperimen/training lokal saja.
+
+-r requirements.txt
+
+# Training static model / eksperimen augmentasi
+tensorflow==2.21.0
+matplotlib>=3.8
+Pillow>=10.0
+
+# Utilitas eksperimen
+scipy>=1.11
